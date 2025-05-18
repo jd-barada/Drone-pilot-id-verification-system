@@ -1,0 +1,239 @@
+import time
+import json
+import machine
+from machine import Pin, I2C, SPI
+import ubinascii
+import urequests
+import network
+import ussl
+import usocket
+import ustruct
+from umqtt.simple import MQTTClient
+import bme280
+import pn532
+
+# Constants
+SEALEVELPRESSURE_HPA = 1013.25
+AWS_IOT_PUBLISH_TOPIC = b"subham"
+AWS_IOT_SUBSCRIBE_TOPIC = b"esp32/sub"
+DRONE_ID = "UA005M4S1EX"
+
+# Pins configuration
+MODEM_TX = 16
+MODEM_RX = 17
+MODEM_PWRKEY = 4
+LED_PIN = 32
+I2C_SDA = 21
+I2C_SCL = 22
+
+# NFC SPI pins
+PN532_SCK = 18
+PN532_MISO = 19
+PN532_MOSI = 23
+PN532_SS = 15
+
+# Initialize I2C for BME280
+i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA))
+bme = bme280.BME280(i2c=i2c, address=0x76)
+
+# Initialize SPI for PN532
+spi = SPI(1, baudrate=1000000, sck=Pin(PN532_SCK), mosi=Pin(PN532_MOSI), miso=Pin(PN532_MISO))
+nfc = pn532.PN532(spi, cs=Pin(PN532_SS))
+nfc.SAM_configuration()
+
+# Initialize LED
+led = Pin(LED_PIN, Pin.OUT)
+led.value(0)
+
+# Initialize modem UART
+uart = machine.UART(1, baudrate=115200, tx=MODEM_TX, rx=MODEM_RX)
+
+# AES Configuration (simplified - MicroPython doesn't have a built-in AES library)
+# You'll need to implement or find a MicroPython compatible AES library
+aes_key = b'\x2B\x7E\x15\x16\x28\xAE\xD2\xA6\xAB\xF7\xF8\x09\xCF\x4F\x3C\x76'
+aes_iv = b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F'
+
+# Global variables
+latitude = 0.0
+longitude = 0.0
+pilot_id = ""
+check = False
+
+def is_vowel(c):
+    c = c.lower()
+    return c in ['a', 'e', 'i', 'o', 'u']
+
+def is_consonant(c):
+    c = c.lower()
+    return c.isalpha() and not is_vowel(c)
+
+def verify_nfc():
+    global pilot_id, check
+    print("Waiting for NFC card...")
+    uid = nfc.read_passive_target()
+    if uid is not None:
+        print("Found card with UID:", [hex(i) for i in uid])
+        
+        # Authenticate with default key
+        if nfc.mifare_classic_authenticate_block(uid, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF):
+            print("Authentication successful")
+            data = nfc.mifare_classic_read_block(1)
+            if data:
+                print("Encrypted data:", data)
+                
+                # In a real implementation, you would decrypt the data here
+                # For this example, we'll simulate decryption
+                decrypted = data  # Replace with actual decryption
+                decrypted_str = decrypted.decode('utf-8', 'ignore')
+                print("Decrypted data:", decrypted_str)
+                
+                # Check conditions (simplified for example)
+                if (is_vowel(decrypted[0]) and is_consonant(decrypted[9]) and is_vowel(decrypted[15])):
+                    part1 = decrypted_str[1:9]
+                    part2 = decrypted_str[10:15]
+                    pilot_id = part1 + part2
+                    print("Card verified")
+                    print("Pilot ID:", pilot_id)
+                    check = True
+                    time.sleep(1)
+                else:
+                    print("Card verification failed")
+            else:
+                print("Failed to read block 1")
+        else:
+            print("Authentication failed")
+    else:
+        print("No card found")
+
+def parse_gps_data(gps_data):
+    global latitude, longitude
+    # Example: "+CGPSINFO: 2017.557807,N,08544.589645,E,020724,063351.0,101.1,0.0,"
+    if "+CGPSINFO:" in gps_data:
+        parts = gps_data.split(',')
+        if len(parts) >= 5:
+            lat_str = parts[0].split(':')[1].strip()
+            lat_dir = parts[1]
+            lon_str = parts[2]
+            lon_dir = parts[3]
+            
+            # Convert to decimal degrees
+            lat_deg = float(lat_str[:2])
+            lat_min = float(lat_str[2:])
+            latitude = lat_deg + (lat_min / 60.0)
+            if lat_dir == 'S':
+                latitude = -latitude
+                
+            lon_deg = float(lon_str[:3])
+            lon_min = float(lon_str[3:])
+            longitude = lon_deg + (lon_min / 60.0)
+            if lon_dir == 'W':
+                longitude = -longitude
+                
+            print("Latitude:", latitude, "Longitude:", longitude)
+
+def get_sensor_data():
+    # Read BME280 data
+    temp, press, hum = bme.read_compensated_data()
+    altitude = bme.read_altitude(SEALEVELPRESSURE_HPA)
+    
+    # Get GPS data
+    uart.write("AT+CGPSINFO\r\n")
+    time.sleep(1)
+    if uart.any():
+        gps_data = uart.read().decode('utf-8')
+        parse_gps_data(gps_data)
+    
+    # Create JSON payload
+    payload = {
+        "lat": latitude,
+        "lng": longitude,
+        "alt": altitude,
+        "uin": DRONE_ID,
+        "pno": pilot_id
+    }
+    
+    return json.dumps(payload)
+
+def mqtt_callback(topic, msg):
+    print("Message received on topic:", topic)
+    print("Message:", msg)
+
+def connect_mqtt():
+    # Configure MQTT client (simplified - you'll need to implement SSL)
+    # In a real implementation, you would use a secure connection
+    client = MQTTClient(
+        client_id="MyEsp32",
+        server="a2u9gyfv7s162-ats.iot.ap-south-1.amazonaws.com",
+        port=8883,
+        ssl=True,
+        ssl_params={
+            "certfile": "/cert.pem",
+            "keyfile": "/privkey.pem",
+            "ca_certs": "/rootca.pem"
+        }
+    )
+    
+    client.set_callback(mqtt_callback)
+    client.connect()
+    client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC)
+    return client
+
+def initialize_modem():
+    print("Initializing modem...")
+    # Send AT commands to initialize modem
+    uart.write("AT\r\n")
+    time.sleep(1)
+    response = uart.read()
+    print("Modem response:", response)
+    
+    # Configure GPS
+    uart.write("AT+CGPS=1\r\n")
+    time.sleep(1)
+    
+    # Configure GPRS
+    uart.write('AT+CGATT=1\r\n')  # Attach to GPRS
+    time.sleep(1)
+    uart.write('AT+CSTT="airtelgprs.com"\r\n')  # Set APN
+    time.sleep(1)
+    uart.write('AT+CIICR\r\n')  # Bring up wireless connection
+    time.sleep(3)
+    uart.write('AT+CIFSR\r\n')  # Get local IP
+    time.sleep(1)
+
+def main():
+    global check
+    
+    # Initialize modem
+    initialize_modem()
+    
+    # Main loop
+    while True:
+        # Check NFC
+        verify_nfc()
+        
+        if check:
+            try:
+                # Connect to MQTT
+                mqtt_client = connect_mqtt()
+                led.value(1)
+                
+                while True:
+                    # Get sensor data
+                    payload = get_sensor_data()
+                    
+                    # Publish data
+                    mqtt_client.publish(AWS_IOT_PUBLISH_TOPIC, payload)
+                    print("Published:", payload)
+                    
+                    # Check for messages
+                    mqtt_client.check_msg()
+                    
+                    time.sleep(5)
+                    
+            except Exception as e:
+                print("Error:", e)
+                led.value(0)
+                time.sleep(5)
+
+if __name__ == "__main__":
+    main()
